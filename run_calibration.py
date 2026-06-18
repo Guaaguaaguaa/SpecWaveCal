@@ -47,8 +47,10 @@ from lamp_registry import get_lamp_config, detect_lamp_from_filename, LAMP_REGIS
 # ==============================================================================
 # 全局工程配置参数（可根据实际实验条件调整）
 # ==============================================================================
-RANSAC_ITERATIONS      = 1000   # RANSAC 随机抽样迭代次数
-RANSAC_MIN_INLIERS_RATIO = 0.6  # 最少需识别出已知波长总数的此比例，否则报错
+RANSAC_ITERATIONS       = 10000   # RANSAC 总迭代次数（v4: 5 轮 × 2000 次/轮，
+                                   # 配合空间约束+覆盖约束+多轮投票保证收敛）
+RANSAC_MIN_INLIERS_RATIO = 0.5   # 最少需识别出已知波长总数的此比例，否则报错
+                                   # 二次模型残差更低但物理上允许适度放宽
 MATCH_TOLERANCE        = 5.0    # 精确质心匹配容差（像素），RANSAC识别出
                                   # 大致对应关系后，此容差用于在精确质心
                                   # 列表中做最终确认匹配
@@ -121,9 +123,9 @@ def generate_report(
         f.write(f"定标处理时间: {current_time}\n")
         f.write(f"数据源输入文件: {file_path}\n")
         f.write(f"选定光源类型: {lamp_name} ({lamp_description})\n")
-        f.write(f"识别方式: RANSAC 自动谱线识别（无需仪器专属锚点先验）\n")
-        f.write(f"RANSAC 线性模型: wavelength = {ransac_result.a:.6f} * pixel "
-                f"+ {ransac_result.b:.4f}\n")
+        f.write(f"识别方式: RANSAC 自动谱线识别（二次模型，无需仪器专属锚点先验）\n")
+        f.write(f"RANSAC 二次模型: WL = {ransac_result.a2:.8e}*px^2 "
+                f"+ {ransac_result.a1:.6f}*px + {ransac_result.a0:.4f}\n")
         f.write(f"RANSAC 识别内点数: {len(ransac_result.inliers)} / "
                 f"{len(true_wavelengths)}\n")
         f.write(f"精确匹配容差: ±{MATCH_TOLERANCE} px\n")
