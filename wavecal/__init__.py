@@ -12,6 +12,7 @@ spectra_tools — CT 光谱仪光谱处理工具包
                                           compute_centroid, compute_skewness
     from spectra_tools.calibration import calibrate, pixel_to_wavelength, \
                                           match_anchors_to_peaks, verify_anchor_ratios
+    from spectra_tools.ransac_matcher import ransac_match_wavelengths, print_ransac_report
     from spectra_tools.explorer    import peak_quality_report
     from spectra_tools.logger      import Logger, RejectReason
     from spectra_tools.config      import Config
@@ -29,6 +30,8 @@ from .calibration import (calibrate, pixel_to_wavelength, wavelength_to_pixel,
                            CalibrationResult,
                            AnchorMatch, match_anchors_to_peaks, verify_anchor_ratios,
                            AnchorMatchError, AnchorRatioError)
+from .ransac_matcher import (ransac_match_wavelengths, print_ransac_report,
+                              RansacMatchResult, RansacInlier, RansacMatchError)
 from .explorer    import (peak_quality_report, suggest_calibration_peaks,
                            print_quality_table, save_quality_csv, PeakQuality)
 
@@ -49,6 +52,9 @@ __all__ = [
     "print_calibration_report", "evaluate_fit_quality", "CalibrationResult",
     "AnchorMatch", "match_anchors_to_peaks", "verify_anchor_ratios",
     "AnchorMatchError", "AnchorRatioError",
+    # ransac_matcher
+    "ransac_match_wavelengths", "print_ransac_report",
+    "RansacMatchResult", "RansacInlier", "RansacMatchError",
     # explorer
     "peak_quality_report", "suggest_calibration_peaks",
     "print_quality_table", "save_quality_csv", "PeakQuality",

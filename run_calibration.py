@@ -1,18 +1,29 @@
 """
 run_calibration.py — 波长定标主流程脚本
-职责：选择数据文件 -> 自动/手动判定光源类型 -> 全谱寻峰 -> 锚点匹配 ->
-      比例交叉验证 -> 多项式拟合 -> 导出结果与报告
+职责：选择数据文件 -> 判定光源类型 -> 全谱寻峰 -> RANSAC自动识别谱线对应关系
+      -> 精确质心匹配 -> 比例交叉验证 -> 多项式拟合 -> 导出结果与报告
 
-与具体光源相关的配置（参考波长、锚点像素位置）都放在 lamp_registry.py 中，
-本脚本只负责流程编排，新增光源类型不需要改动此文件。
+与具体光源相关的配置（参考波长）放在 lamp_registry.py 中，本脚本只负责
+流程编排。新增光源类型只需在 lamp_registry.py 添加 true_wavelengths，
+不需要为每台具体仪器录入锚点像素位置——RANSAC 自动识别取代了这一步。
 
 使用方式：
     直接运行: python run_calibration.py
     会弹出文件选择窗口，选择 CSV 后自动执行完整定标流程。
 
 设计原则（务必遵守）：
-    任何环节出现异常（找不到合格候选峰、比例交叉验证失败等），
+    任何环节出现异常（RANSAC 找不到足够内点、比例交叉验证失败等），
     立即弹窗报错并中止整个流程，不做任何静默兜底或退化处理。
+
+设计说明（RANSAC 取代手动锚点匹配后的流程变化）：
+    旧流程：读取注册表 anchor_pixels → 估算全局 Shift → 在锚点附近
+            ±5px 窗口内查找 → match_anchors_to_peaks 做容差匹配
+    新流程：全谱寻峰得到全部候选峰 → RANSAC 在候选峰与已知波长之间
+            自动识别对应关系（不需要任何仪器专属的锚点先验）→
+            后续比例验证、拟合、报告生成沿用原有逻辑不变
+
+    旧流程的 Shift 估算和 anchor_pixels 仍保留在 lamp_registry.py 中
+    作为可选的向后兼容能力，但不再是本脚本的主路径。
 """
 
 import os
@@ -26,8 +37,9 @@ from tkinter import filedialog, messagebox, simpledialog
 from wavecal import (
     run_explorer, Config,
     match_anchors_to_peaks, verify_anchor_ratios,
-    calibrate, pixel_to_wavelength,
-    AnchorMatchError, AnchorRatioError,
+    calibrate, pixel_to_wavelength, print_calibration_report,
+    ransac_match_wavelengths, print_ransac_report,
+    AnchorMatchError, AnchorRatioError, RansacMatchError,
 )
 from lamp_registry import get_lamp_config, detect_lamp_from_filename, LAMP_REGISTRY
 
@@ -35,10 +47,13 @@ from lamp_registry import get_lamp_config, detect_lamp_from_filename, LAMP_REGIS
 # ==============================================================================
 # 全局工程配置参数（可根据实际实验条件调整）
 # ==============================================================================
-MATCH_TOLERANCE       = 5.0    # 锚点匹配容差（像素），超过此距离视为找不到匹配
-RATIO_TOLERANCE        = 0.10   # 比例交叉验证容差（相对偏差）
-CALIBRATION_DEGREE     = 3      # 定标多项式阶数
-MANUAL_SHIFT_OVERRIDE  = None   # 手动Shift覆盖；None 则启动自动 Shift 评估
+RANSAC_ITERATIONS      = 1000   # RANSAC 随机抽样迭代次数
+RANSAC_MIN_INLIERS_RATIO = 0.6  # 最少需识别出已知波长总数的此比例，否则报错
+MATCH_TOLERANCE        = 5.0    # 精确质心匹配容差（像素），RANSAC识别出
+                                  # 大致对应关系后，此容差用于在精确质心
+                                  # 列表中做最终确认匹配
+RATIO_TOLERANCE         = 0.10   # 比例交叉验证容差（相对偏差）
+CALIBRATION_DEGREE      = 3      # 定标多项式阶数
 
 
 # ==============================================================================
@@ -65,7 +80,6 @@ def resolve_lamp_name(file_path: str) -> str:
     if detected is not None:
         return detected
 
-    # 自动判断失败，弹窗要求手动选择
     available = list(LAMP_REGISTRY.keys())
     choice = simpledialog.askstring(
         "无法自动识别光源类型",
@@ -80,31 +94,8 @@ def resolve_lamp_name(file_path: str) -> str:
     return choice
 
 
-def auto_estimate_global_shift(
-    intensity     : np.ndarray,
-    anchor_pixel  : float,
-    search_radius : int = 50,
-) -> int:
-    """
-    通过在较宽范围内扫描强特征峰的极大值，自动计算系统硬件的整体
-    像素漂移偏置量（Shift）。仅用于后续锚点匹配前的粗略对齐，
-    精确质心仍由 find_peaks 的完整流程给出。
-    """
-    anchor_idx = int(round(anchor_pixel))
-    start = max(0, anchor_idx - search_radius)
-    end   = min(len(intensity), anchor_idx + search_radius + 1)
-    sub_array = intensity[start:end]
-
-    if len(sub_array) == 0:
-        return 0
-
-    local_max_idx = int(np.argmax(sub_array))
-    actual_peak_pixel = start + local_max_idx
-    return int(actual_peak_pixel - anchor_idx)
-
-
 def run_full_pipeline(intensity: np.ndarray, log_path: str):
-    """跑完整寻峰流程，返回 PipelineResult（含全部合格候选峰）。"""
+    """跑完整寻峰流程，返回 PipelineResult（含全部候选峰，不论是否通过质量检测）。"""
     cfg = Config(log_path=log_path, quality_csv_path="")
     result = run_explorer(intensity, cfg, save_csv=False)
     return result
@@ -115,12 +106,12 @@ def generate_report(
     file_path           : str,
     lamp_name           : str,
     lamp_description     : str,
-    shift_mode           : str,
+    ransac_result        ,
     matches              : list,
     true_wavelengths      : list,
     calibration_result    ,
 ) -> None:
-    """生成定标质量报告文本文件，沿用原有报告风格。"""
+    """生成定标质量报告文本文件。"""
     current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with open(report_path, "w", encoding="utf-8") as f:
@@ -130,13 +121,20 @@ def generate_report(
         f.write(f"定标处理时间: {current_time}\n")
         f.write(f"数据源输入文件: {file_path}\n")
         f.write(f"选定光源类型: {lamp_name} ({lamp_description})\n")
-        f.write(f"像素偏移偏置模式 (Shift Mode): {shift_mode}\n")
-        f.write(f"锚点匹配容差: ±{MATCH_TOLERANCE} px\n")
+        f.write(f"识别方式: RANSAC 自动谱线识别（无需仪器专属锚点先验）\n")
+        f.write(f"RANSAC 线性模型: wavelength = {ransac_result.a:.6f} * pixel "
+                f"+ {ransac_result.b:.4f}\n")
+        f.write(f"RANSAC 识别内点数: {len(ransac_result.inliers)} / "
+                f"{len(true_wavelengths)}\n")
+        f.write(f"精确匹配容差: ±{MATCH_TOLERANCE} px\n")
         f.write(f"比例交叉验证容差: ±{RATIO_TOLERANCE:.0%}\n\n")
 
+        if ransac_result.unmatched_wavelengths:
+            f.write(f"*** 未被识别的已知波长: {ransac_result.unmatched_wavelengths} ***\n\n")
+
         f.write("------------------ 寻峰与拟合明细 ------------------\n")
-        f.write(f"{'序号':<4}{'标准波长(nm)':<14}{'理论锚点':<10}"
-                f"{'匹配质心(px)':<14}{'匹配距离':<10}{'标定波长(nm)':<16}"
+        f.write(f"{'序号':<4}{'标准波长(nm)':<14}{'RANSAC粗定位(px)':<18}"
+                f"{'精确质心(px)':<14}{'匹配距离':<10}{'标定波长(nm)':<16}"
                 f"{'残差(nm)':<12}质量检测\n")
 
         for i, m in enumerate(matches):
@@ -145,7 +143,7 @@ def generate_report(
             status    = "通过" if m.passed_all else f"标记: {'; '.join(m.fail_reasons)}"
             f.write(f"{i+1:<6}"
                     f"{true_wavelengths[i]:<16.3f}"
-                    f"{m.anchor_pixel:<12.1f}"
+                    f"{m.anchor_pixel:<16.1f}"
                     f"{m.matched_centroid:<16.3f}"
                     f"{m.distance:<12.3f}"
                     f"{fitted_wl:<18.4f}"
@@ -192,26 +190,12 @@ def run_wavelength_calibration():
             intensity = np.asarray(df.iloc[:, 1].values, dtype=float)
         else:
             intensity = np.asarray(df.iloc[:, 0].values, dtype=float)
-        # 像素索引始终由行号生成，不依赖文件中的任何列
-        # （find_peaks 内部本身就用数组下标，此处仅为显式说明，不需要单独变量）
 
         # ── 3. 判定光源类型 ──────────────────────────────────────────────────
         lamp_name = resolve_lamp_name(file_path)
         lamp      = get_lamp_config(lamp_name)
 
-        # ── 4. 全局 Shift 预估（粗筛，提高鲁棒性）──────────────────────────────
-        if MANUAL_SHIFT_OVERRIDE is not None:
-            global_shift = int(MANUAL_SHIFT_OVERRIDE)
-            shift_mode   = f"手动指定值 ({global_shift:+d} px)"
-        else:
-            global_shift = auto_estimate_global_shift(
-                intensity, lamp.auto_shift_anchor, lamp.shift_search_radius,
-            )
-            shift_mode = f"系统自动评估 ({global_shift:+d} px)"
-
-        shifted_anchors = [a + global_shift for a in lamp.anchor_pixels]
-
-        # ── 5. 全谱完整寻峰，拿到全部候选峰质心（不论是否通过质量检测）──────────
+        # ── 4. 全谱完整寻峰，拿到全部候选峰（不论是否通过质量检测）─────────────
         log_path = os.path.join(dir_name, f"{base_name}_peakfind_log.txt")
         pipeline_result = run_full_pipeline(intensity, log_path)
         candidate_centroids = pipeline_result.centroids
@@ -224,11 +208,26 @@ def run_wavelength_calibration():
                 f"详细检测记录请查看: {log_path}"
             )
 
-        # ── 6. 锚点匹配（找不到立即报错，不做任何静默兜底）──────────────────────
-        # 注：匹配池包含全部候选峰，不论是否通过质量检测；匹配到的峰若存在
-        # 质量标记会在报告中标注，由人工判断是否采用该定标结果
+        # ── 5. RANSAC 自动识别候选峰与已知波长的对应关系 ───────────────────────
+        # 不需要任何仪器专属的锚点像素先验，对通道数、整体平移、分辨率
+        # 差异均有鲁棒性
+        min_inliers = max(2, int(np.ceil(len(lamp.true_wavelengths)
+                                          * RANSAC_MIN_INLIERS_RATIO)))
+        ransac_result = ransac_match_wavelengths(
+            candidate_centroids = candidate_centroids,
+            true_wavelengths    = lamp.true_wavelengths,
+            tolerance_nm        = lamp.ransac_tolerance_nm,
+            n_iterations        = RANSAC_ITERATIONS,
+            min_inliers         = min_inliers,
+        )
+        print_ransac_report(ransac_result)
+
+        # ── 6. 精确匹配（用 RANSAC 识别出的对应关系作为锚点，做最终确认匹配）────
+        # RANSAC 阶段的线性模型只是粗定位脚手架；这一步把粗定位像素作为
+        # "理论锚点"，去全部候选峰质心列表中做精确容差匹配，并带上质量标记
+        ransac_anchor_pixels = ransac_result.matched_centroids
         matches = match_anchors_to_peaks(
-            anchor_pixels      = shifted_anchors,
+            anchor_pixels      = ransac_anchor_pixels,
             peak_centroids     = candidate_centroids,
             match_tolerance    = MATCH_TOLERANCE,
             peak_passed_flags  = candidate_passed,
@@ -239,12 +238,14 @@ def run_wavelength_calibration():
         verify_anchor_ratios(matches, tolerance=RATIO_TOLERANCE)
 
         # ── 8. 多项式拟合 ────────────────────────────────────────────────────
-        matched_centroids = [m.matched_centroid for m in matches]
+        matched_centroids  = [m.matched_centroid for m in matches]
+        matched_wavelengths = ransac_result.matched_wavelengths
         calibration_result = calibrate(
             centroids   = matched_centroids,
-            wavelengths = lamp.true_wavelengths,
+            wavelengths = matched_wavelengths,
             degree      = CALIBRATION_DEGREE,
         )
+        print_calibration_report(calibration_result, matches=matches)
 
         # ── 9. 导出全谱定标波长 CSV ───────────────────────────────────────────
         all_pixels = np.arange(len(intensity))
@@ -264,23 +265,26 @@ def run_wavelength_calibration():
             file_path           = file_path,
             lamp_name           = lamp_name,
             lamp_description     = lamp.description,
-            shift_mode           = shift_mode,
+            ransac_result        = ransac_result,
             matches              = matches,
-            true_wavelengths      = lamp.true_wavelengths,
+            true_wavelengths      = matched_wavelengths,
             calibration_result    = calibration_result,
         )
 
         # ── 11. 成功提示 ─────────────────────────────────────────────────────
         n_flagged = sum(1 for m in matches if not m.passed_all)
         flag_note = f"\n⚠ {n_flagged} 个匹配点存在质量标记，详见报告" if n_flagged > 0 else ""
+        unmatched_note = (f"\n⚠ {len(ransac_result.unmatched_wavelengths)} 条已知波长未被识别"
+                          if ransac_result.unmatched_wavelengths else "")
         messagebox.showinfo(
             "波长定标成功",
             f"定标任务顺利完成！\n\n"
             f"光源类型: {lamp_name}\n"
+            f"RANSAC 识别内点数: {len(ransac_result.inliers)} / {len(lamp.true_wavelengths)}\n"
             f"使用锚点数: {len(matches)}\n"
             f"RMS残差: {calibration_result.rms_nm:.4f} nm\n"
             f"最大残差: {calibration_result.max_resid_nm:.4f} nm"
-            f"{flag_note}\n\n"
+            f"{flag_note}{unmatched_note}\n\n"
             f"已导出:\n"
             f"1. {base_name}_calibrated.csv\n"
             f"2. {base_name}_wavecal_report.txt\n"
@@ -288,8 +292,8 @@ def run_wavelength_calibration():
         )
         print(f"定标成功完成，结果已保存至: {dir_name}")
 
-    except (AnchorMatchError, AnchorRatioError) as e:
-        messagebox.showerror("定标中止：锚点匹配/验证失败", str(e))
+    except (AnchorMatchError, AnchorRatioError, RansacMatchError) as e:
+        messagebox.showerror("定标中止：自动识别/匹配/验证失败", str(e))
         print(f"定标中止: {e}", file=sys.stderr)
 
     except SystemExit as e:
@@ -306,3 +310,4 @@ def run_wavelength_calibration():
 
 if __name__ == "__main__":
     run_wavelength_calibration()
+    

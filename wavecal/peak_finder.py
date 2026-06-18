@@ -98,9 +98,9 @@ def find_peaks(
     logger      : Logger,
     local_noise : Optional[np.ndarray] = None,
     # ── 基线/SNR 参数 ──────────────────────
-    min_snr         : float = 10.0,
+    min_snr         : float = 5,
     # ── 峰间距 ────────────────────────────
-    min_peak_sep    : int   = 20,
+    min_peak_sep    : int   = 10,
     # ── 边界收敛判定 ──────────────────────
     boundary_n_sigma: float = 3.0,
     boundary_consec : int   = 3,
