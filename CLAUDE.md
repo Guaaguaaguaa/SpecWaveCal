@@ -1,99 +1,160 @@
-# SpecWaveCal — 项目 CLAUDE.md
+# CLAUDE.md
 
-## 网络与 Git 推送
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-### 问题
+## 项目概述
 
-本机网络环境存在 TCP 端口阻断：
+SpecWaveCal 是一个**光谱仪波长定标工具包**——从原始光谱强度数据中自动识别特征峰，匹配到已知参考波长（如 NIST HgAr 谱线），并拟合像素→波长的多项式转换关系。
 
-| 协议 | 端口 | 状态 |
-|------|------|------|
-| Git HTTPS (`git push/pull`) | 443 | ❌ TCP 层阻断，无法直连 |
-| Git SSH (`git@github.com`) | 22 | ❌ Permission denied（`~/.ssh/id_rsa` 未关联 GitHub） |
-| `gh` CLI REST API (`api.github.com`) | 443 | ✅ 可用，已认证 |
+核心设计目标：**不需要针对每台具体仪器录入锚点像素位置**。不同型号、不同通道数、不同分辨率的仪器，只要使用同一种标准光源（如 HgAr 灯），就能自动完成定标。
 
-### 正确推送方式
+## 整体架构：四阶段流水线
 
-**永远不要直接执行 `git push`**——它会反复重试 21 秒后超时。
+```
+原始光谱 CSV (2048行, intensity)
+    │
+    ▼
+┌──────────────────────────────────────────────┐
+│ Stage 1: 基线估计  (baseline.py)              │
+│   - 滚动百分位数法估计逐像素基线               │
+│   - 用无峰区域估计全局噪声 σ                  │
+│   - 估计局部噪声（自适应不同区域背景差异）     │
+│   - 输出: baseline[n], noise_std, local_noise  │
+└──────────────────────────────────────────────┘
+    │ I_corr = intensity - baseline
+    ▼
+┌──────────────────────────────────────────────┐
+│ Stage 2: 寻峰 + 质心定位  (peak_finder.py)    │
+│   - scipy.find_peaks 粗定位（高度+间距过滤）   │
+│   - 边界拓展：从峰顶向两侧走到回落到基线       │
+│   - 核心窗口内计算亚像素质心（强度加权重心）   │
+│   - 质量打标（SNR/对称性/宽度/边界）但不剔除   │
+│   - 输出: list[PeakResult], 每个含 centroid    │
+└──────────────────────────────────────────────┘
+    │ all candidate centroids
+    ▼
+┌──────────────────────────────────────────────┐
+│ Stage 3: RANSAC 谱线识别 (ransac_matcher.py)  │
+│   - 在候选峰与已知波长之间自动建立对应关系     │
+│   - 不需要任何仪器专属的锚点像素               │
+│   - 输出: 一一对应的 (pixel, wavelength) 对    │
+└──────────────────────────────────────────────┘
+    │ matched pairs
+    ▼
+┌──────────────────────────────────────────────┐
+│ Stage 4: 多项式拟合 + 验证 (calibration.py)    │
+│   - 精确容差匹配 + 比例交叉验证               │
+│   - 三次多项式最小二乘拟合 (λ vs px)          │
+│   - 输出: 像素→波长转换函数 + 质量报告        │
+└──────────────────────────────────────────────┘
+```
 
-使用项目自带的 `gh-api-push.sh` 脚本，走 GitHub REST API 的 Git Data API 推送：
+## RANSAC 谱线识别的原理与设计演进
+
+这是整个项目最核心的算法，也是最容易出问题的地方。
+
+### 为什么需要 RANSAC
+
+不同仪器的同一光源（如 HgAr 灯），同一个特征峰的像素位置可以差 3-5 倍：2048 通道仪器上 HgAr 696.5 nm 在 ~884 px，512 通道仪器上在 ~270 px。不能硬编码锚点像素——这是项目的基本要求。
+
+但**谱线间的相对几何关系是稳定的**：在一阶近似下，像素和波长接近线性关系。RANSAC 利用这一点，随机抽取候选峰，假设它们对应某些已知波长，解出临时映射，再检验其他峰是否也符合这个映射。
+
+### v1 → v4 的演进
+
+**v1（线性 RANSAC，已废弃）**：`wavelength = a·pixel + b`，随机抽 2 个点。
+
+为什么失败：光栅光谱仪的真实关系是 `λ ∝ sin(θ)`，在 435-966 nm 范围内曲率显著。线性模型在中间区域残差高达 36 nm，远大于 HgAr 谱线最小间距 14.6 nm。导致最近邻投票产生**系统性偏移**——px=1085 的预测波长 727.0 nm 离邻近的 727.3 nm 仅 0.27 nm，算法误以为匹配成功，但它实际对应 763.5 nm。
+
+**v4（当前版本）**：`wavelength = a2·px² + a1·px + a0`，随机抽 3 个点，配多重保障：
+
+| 保障机制 | 作用 |
+|----------|------|
+| 空间多样性约束 | 3 个抽样点必须跨越 ≥30% 像素范围，避免挤在局部 |
+| 波长覆盖约束 | 模型预测的波长跨度必须 ≥40% 真值跨度，过滤退化模型 |
+| 单调性约束 | 匹配的 (px, WL) 对必须严格单调，防止交叉错配 |
+| 5 轮独立投票 | 每轮用不同随机种子，取内点数最多的结果 |
+| 主动搜索 | 用精修模型反向定位遗漏波长的预期像素位置 |
+| 覆盖安全检查 + 救援轮 | 匹配波长范围不足 85% 真值范围时追加 3 轮 |
+
+### 关键参数
+
+- `RANSAC_ITERATIONS = 10000`（在 run_calibration.py）：总迭代数，5 轮 × 2000 次/轮
+- `RANSAC_MIN_INLIERS_RATIO = 0.5`：最少需识别 50% 的已知波长
+- `tolerance_nm = 2.0`：内点判定容差（nm）。二次模型残差 < 0.5 nm，2 nm 安全余量充足
+- `ransac_tolerance_nm`（在 lamp_registry.py 每个光源上）：该光源的推荐容差
+
+## 峰值检测的设计哲学
+
+**务实优先策略**：所有候选峰（包括存在质量标记的）都参与后续匹配，不做硬性剔除。质量标记只打标签（`passed_all` / `fail_reasons`），供人工参考。
+
+原因：实际数据中某些 HgAr 特征峰在低分辨率仪器上会和邻近峰部分重叠（边界鞍点过高），或峰形略微不对称——但这些峰仍可能是可用的。自动剔除容易因单一阈值不合理而连锁影响定标。
+
+### 关键寻峰参数
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `min_snr` | 5 | 最小 SNR，scipy.find_peaks 的 height 阈值 |
+| `min_peak_sep` | 10 px | 最小峰间距，防止将双峰误判为一个 |
+| `boundary_n_sigma` | 3.0 | 边界回落阈值 = baseline + N×σ |
+| `max_half_width` | 40 px | 单侧最大半宽，超过则强制截断 |
+| `saddle_n_sigma` | 1.5 | 谷底判定宽容倍数，区分"真正收敛"和"双峰连叠" |
+
+`min_peak_sep=10` 是特意从 20 调下来的——不同仪器色散率差异大，低色散端相邻 HgAr 线可能仅相距 ~15 px，20 太保守会吞掉真实峰。
+
+## 基线估计
+
+采用**滚动百分位数法**，不依赖任何峰形假设：
+
+1. 将光谱分成窗口（默认 100 px），每窗口取低百分位数（默认 10%）作为局部基线控制点
+2. 线性插值还原到逐像素分辨率
+3. 噪声 σ 用无峰区域（`residual < 3×MAD`）的标准差估计
+
+局部噪声估计（`estimate_local_noise`）为每个像素计算局部窗口内的噪声水平，用于自适应边界判定——强峰附近的"脏背景"和干净区域的阈值不同。
+
+## 光源注册表 (lamp_registry.py)
+
+新增光源只需在 `LAMP_REGISTRY` 字典中添加条目，不需要改动任何流程代码：
+
+```python
+"HgAr": LampConfig(
+    name="HgAr",
+    description="汞氩灯",
+    true_wavelengths=[435.833, 546.074, ...],  # NIST 参考值，唯一必需字段
+    anchor_pixels=[202, 477, ...],              # 可选，仅用于旧版兼容/调试
+    ransac_tolerance_nm=2.0,                    # RANSAC 推荐容差
+)
+```
+
+## 项目文件职责
+
+| 文件 | 职责 |
+|------|------|
+| `run_calibration.py` | 主入口：文件选择→光源判定→完整定标流水线→结果导出 |
+| `run_explore.py` | 探索入口：仅做寻峰和质量报告，不做定标 |
+| `debug_peak.py` | 调试工具：检查指定像素区间的原始数据和阈值 |
+| `lamp_registry.py` | 光源配置注册表 + 仪器模板库 |
+| `wavecal/baseline.py` | 基线与噪声估计 |
+| `wavecal/peak_finder.py` | 寻峰、边界拓展、质心定位、质量打标 |
+| `wavecal/ransac_matcher.py` | RANSAC 自动谱线识别（核心） |
+| `wavecal/calibration.py` | 多项式拟合、锚点匹配、比例验证 |
+| `wavecal/pipeline.py` | 流水线组装（run_explorer / run_pipeline） |
+| `wavecal/explorer.py` | 峰质量分析、评分、定标峰推荐 |
+| `wavecal/config.py` | 全局参数管理（dataclass，支持 JSON 读写） |
+| `wavecal/logger.py` | 结构化日志（含时间戳、舍弃原因、汇总） |
+
+## 日常开发命令
 
 ```bash
-# 基本用法（推送当前分支到 origin）
-./gh-api-push.sh
+# 运行主定标流程（弹出文件选择窗口）
+python run_calibration.py
 
-# 指定分支和提交信息
-./gh-api-push.sh -b main -m "feat: add peak detection"
+# 运行探索模式（只看峰质量报告，不做定标）
+python run_explore.py
 
-# 预演（不实际推送）
-./gh-api-push.sh --dry-run
-```
+# 调试特定峰（修改 START/END 区间后运行）
+python debug_peak.py
 
-**原理**：为每个文件创建 Git Blob（base64 编码）→ 组装 Git Tree → 创建 Git Commit → 更新 Branch Ref。
-
-**前提**：
-- `gh` CLI 已安装且已认证（`gh auth status` 确认）
-- 远端 GitHub 仓库已存在
-- 仓库 URL: `https://github.com/Guaaguaaguaa/SpecWaveCal.git`
-
-### 初始化新仓库到 GitHub 的标准流程
-
-```bash
-# 1. 本地初始化
-git init && git add -A && git commit -m "Initial commit"
-
-# 2. 创建 GitHub 仓库（如尚未创建）
-gh repo create SpecWaveCal --public --description "..."
-
-# 3. 添加 remote
-git remote add origin https://github.com/Guaaguaaguaa/SpecWaveCal.git
-
-# 4. 推送（用 API 脚本，不是 git push！）
-./gh-api-push.sh -b main
-```
-
-### Git 用户信息
-
-- GitHub 用户: `Guaaguaaguaa`
-- Email: `xinxin_ok_good@126.com`
-- GitHub Token: 已存在 Windows 凭据管理器，`gh` 自动使用
-
-## 项目结构
-
-```
-SpecWaveCal/
-├── run_calibration.py   # 主校准入口
-├── run_explore.py       # 探索模式入口
-├── debug_peak.py        # 峰值调试工具
-├── lamp_registry.py     # 光源注册表
-├── gh-api-push.sh       # ★ API 推送脚本
-└── wavecal/
-    ├── __init__.py
-    ├── pipeline.py      # 校准流水线
-    ├── calibration.py   # 波⻓校准核心
-    ├── peak_finder.py   # 峰值查找
-    ├── baseline.py      # 基线校正
-    ├── explorer.py      # 参数探索
-    ├── config.py        # 配置管理
-    └── logger.py        # 日志
-```
-
-## 常见操作
-
-### 推送代码
-
-```bash
-# 1. 正常 git add / commit
+# 提交并推送（git push 在本机不可用，走 REST API）
 git add -A && git commit -m "描述改动"
-
-# 2. 用 API 推送
-./gh-api-push.sh
-```
-
-### 从 GitHub 拉取（如果远端有新提交）
-
-```bash
-# 方式 1: gh API 获取远端文件覆盖本地（简单但粗暴）
-# 方式 2: 直接通过浏览器下载 ZIP，解压覆盖后重新 commit
-# 方式 3: 换用其它网络环境执行 git pull
+~/.claude/scripts/gh-api-push.sh
 ```
