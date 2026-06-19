@@ -12,7 +12,7 @@ ransac_matcher.py — 基于 RANSAC 的自动谱线识别
     2. 波长覆盖约束 — 模型预测的波长跨度必须 >= 真值跨度的 50%
     3. 单调性约束 — 匹配的 (像素, 波长) 对必须严格单调
     4. 主动搜索 — 用精修模型反向定位遗漏的波长
-    5. 多轮独立运行 — 3 轮独立 RANSAC，取内点数最多的结果
+    5. 多轮独立运行 — 5 轮独立 RANSAC，取内点数最多的结果
 
     为什么不用 sin 模型：
     二次多项式在 435-966 nm 范围内残差 < 0.5 nm，远小于 HgAr 最小线距
@@ -40,10 +40,8 @@ class RansacMatchError(Exception):
 
 @dataclass
 class RansacInlier:
-    centroid_pixel      : float
-    true_wavelength     : float
-    predicted_wavelength: float
-    residual_nm         : float
+    centroid_pixel : float
+    true_wavelength: float
 
 
 @dataclass
@@ -58,26 +56,10 @@ class RansacMatchResult:
     inlier_tolerance_nm: float
 
     @property
-    def a(self) -> float:
-        if not self.inliers: return 0.0
-        mean_px = np.mean([x.centroid_pixel for x in self.inliers])
-        return float(2 * self.a2 * mean_px + self.a1)
-
-    @property
-    def b(self) -> float:
-        if not self.inliers: return 0.0
-        mean_px = np.mean([x.centroid_pixel for x in self.inliers])
-        return float(self.a0 - self.a2 * mean_px ** 2)
-
-    @property
-    def matched_centroids(self) -> List[float]:
-        return [inl.centroid_pixel for inl in
-                sorted(self.inliers, key=lambda x: x.true_wavelength)]
-
-    @property
-    def matched_wavelengths(self) -> List[float]:
-        return [inl.true_wavelength for inl in
-                sorted(self.inliers, key=lambda x: x.true_wavelength)]
+    def calibration_pairs(self) -> List[tuple]:
+        """按波长升序的 (centroid_pixel, wavelength_nm) 对，可直接喂给 calibrate()。"""
+        return [(inl.centroid_pixel, inl.true_wavelength)
+                for inl in sorted(self.inliers, key=lambda x: x.true_wavelength)]
 
     def predict(self, pixel: float) -> float:
         return float(self.a2 * pixel ** 2 + self.a1 * pixel + self.a0)
@@ -105,10 +87,7 @@ def _ransac_one_round(
     wl_max = float(wavelengths_arr.max())
     span_threshold = 0.3 * (px_max - px_min)
 
-    # 波长覆盖预计算
-    px_range = px_max - px_min
     wl_range = wl_max - wl_min
-    min_a_equiv = 0.4 * wl_range / px_range if px_range > 0 else 0
 
     for _ in range(n_iterations):
         if len(candidates_arr) < 3 or len(wavelengths_arr) < 3:
@@ -302,53 +281,91 @@ def ransac_match_wavelengths(
                 f"精修后色散方向不满足单调递增 (最小导数={min_deriv:.6f})。"
             )
 
-    # ── 主动搜索遗漏波长 ─────────────────────────────────────────────────
-    matched_wl_set = set(w for _, w in best_pairs)
-    matched_c_set = set(c for c, _ in best_pairs)
-    search_tol_px = 30.0
-
-    for wl_idx in range(len(wavelengths)):
-        if wl_idx in matched_wl_set:
-            continue
-        wl = wavelengths_arr[wl_idx]
-        disc = refined_a1 ** 2 - 4 * refined_a2 * (refined_a0 - wl)
-        if disc < 0 or abs(refined_a2) < 1e-15:
-            continue
-        px1 = (-refined_a1 + np.sqrt(disc)) / (2 * refined_a2)
-        px2 = (-refined_a1 - np.sqrt(disc)) / (2 * refined_a2)
-        pred_px = px1 if px_min <= px1 <= px_max else (
-            px2 if px_min <= px2 <= px_max else None
-        )
-        if pred_px is None:
-            continue
-        dists = np.abs(candidates_arr - pred_px)
-        nearest = int(np.argmin(dists))
-        if dists[nearest] <= search_tol_px and nearest not in matched_c_set:
-            best_pairs.append((nearest, wl_idx))
-            matched_c_set.add(nearest)
-            matched_wl_set.add(wl_idx)
-
-    # ── 覆盖范围安全检查 ─────────────────────────────────────────────────
+    # ── 覆盖范围安全检查 + 救援 RANSAC ─────────────────────────────────
     # 正确模型必须覆盖大部分真值波长范围。若不足 85%，
-    # 追加额外轮次（用不同的随机种子）尝试找到更优模型。
+    # 追加额外轮次尝试找到更优模型。必须在主动搜索之前执行，
+    # 否则救援结果会覆盖主动搜索已补入的点。
     matched_wls_for_check = [wavelengths_arr[w] for _, w in best_pairs]
     wl_coverage = ((max(matched_wls_for_check) - min(matched_wls_for_check))
                    / (float(wavelengths_arr.max()) - float(wavelengths_arr.min()))
                    ) if matched_wls_for_check else 0
 
     if wl_coverage < 0.85 and len(best_pairs) < len(wavelengths):
-        # 追加 3 轮救援 RANSAC，用更大的种子偏移
         for rescue_idx in range(3):
             rescue_seed = (random_seed or 0) + 12345 + rescue_idx * 7919
             rescue_rng = random.Random(rescue_seed)
-            a2, a1, a0, rescue_pairs = _ransac_one_round(
+            a2r, a1r, a0r, rescue_pairs = _ransac_one_round(
                 candidates_arr, wavelengths_arr,
-                tolerance_nm, per_round_iterations * 2,  # 双倍迭代
+                tolerance_nm, per_round_iterations * 2,
                 require_positive_slope, rescue_rng,
             )
-            if a2 is not None and len(rescue_pairs) > len(best_pairs):
-                best_a2, best_a1, best_a0 = a2, a1, a0
+            if a2r is not None and len(rescue_pairs) > len(best_pairs):
+                best_a2, best_a1, best_a0 = a2r, a1r, a0r
                 best_pairs = rescue_pairs
+
+    # 救援后重新精修
+    inlier_px = np.array([candidates_arr[c] for c, _ in best_pairs])
+    inlier_wl = np.array([wavelengths_arr[w] for _, w in best_pairs])
+    A = np.vstack([inlier_px ** 2, inlier_px, np.ones_like(inlier_px)]).T
+    coeffs = np.linalg.lstsq(A, inlier_wl, rcond=None)[0]
+    refined_a2, refined_a1, refined_a0 = (
+        float(coeffs[0]), float(coeffs[1]), float(coeffs[2]),
+    )
+
+    if require_positive_slope:
+        if refined_a2 >= 0:
+            min_deriv = 2 * refined_a2 * px_min + refined_a1
+        else:
+            min_deriv = 2 * refined_a2 * px_max + refined_a1
+        if min_deriv <= 1e-9:
+            raise RansacMatchError(
+                f"精修后色散方向不满足单调递增 (最小导数={min_deriv:.6f})。"
+            )
+
+    # ── 主动搜索遗漏波长 ─────────────────────────────────────────────────
+    matched_wl_set = set(w for _, w in best_pairs)
+    matched_c_set = set(c for c, _ in best_pairs)
+    # 允许预测像素附近寻找遗漏谱线。
+    # 30 px 约等于典型峰宽的 2~3 倍，
+    # 用于容忍粗定位模型残余非线性误差。
+    search_tol_px = 30.0
+
+    for wl_idx in range(len(wavelengths)):
+        if wl_idx in matched_wl_set:
+            continue
+        wl = wavelengths_arr[wl_idx]
+
+        # 数值稳定：接近线性时用线性公式，避免二次求根病态
+        if abs(refined_a2) < 1e-8:
+            pred_px = (wl - refined_a0) / refined_a1 if abs(refined_a1) > 1e-9 else None
+        else:
+            disc = refined_a1 ** 2 - 4 * refined_a2 * (refined_a0 - wl)
+            if disc < 0:
+                pred_px = None
+            else:
+                px1 = (-refined_a1 + np.sqrt(disc)) / (2 * refined_a2)
+                px2 = (-refined_a1 - np.sqrt(disc)) / (2 * refined_a2)
+                pred_px = px1 if px_min <= px1 <= px_max else (
+                    px2 if px_min <= px2 <= px_max else None
+                )
+        if pred_px is None:
+            continue
+        dists = np.abs(candidates_arr - pred_px)
+        nearest = int(np.argmin(dists))
+        if dists[nearest] > search_tol_px or nearest in matched_c_set:
+            continue
+
+        # 拓扑验证：补入该点后像素↑→波长↑必须保持严格单调
+        trial_pairs = best_pairs + [(nearest, wl_idx)]
+        trial_sorted = sorted(trial_pairs, key=lambda x: candidates_arr[x[0]])
+        trial_wls = [wavelengths_arr[w] for _, w in trial_sorted]
+        if not all(trial_wls[i] < trial_wls[i + 1]
+                   for i in range(len(trial_wls) - 1)):
+            continue  # 拓扑破坏，拒绝此补点
+
+        best_pairs.append((nearest, wl_idx))
+        matched_c_set.add(nearest)
+        matched_wl_set.add(wl_idx)
 
     # 最终拟合
     final_px = np.array([candidates_arr[c] for c, _ in best_pairs])
@@ -359,6 +376,18 @@ def ransac_match_wavelengths(
         float(final_coeffs[0]), float(final_coeffs[1]), float(final_coeffs[2]),
     )
 
+    # 主动搜索补点后最终模型再次验证色散方向
+    if require_positive_slope:
+        if final_a2 >= 0:
+            min_deriv_f = 2 * final_a2 * px_min + final_a1
+        else:
+            min_deriv_f = 2 * final_a2 * px_max + final_a1
+        if min_deriv_f <= 1e-9:
+            raise RansacMatchError(
+                f"主动搜索后最终模型色散方向不满足单调递增 "
+                f"(最小导数={min_deriv_f:.6f})。"
+            )
+
     # ── 组装结果 ─────────────────────────────────────────────────────────
     inliers: List[RansacInlier] = []
     matched_c_set = set()
@@ -367,12 +396,9 @@ def ransac_match_wavelengths(
     for c_idx, wl_idx in best_pairs:
         px = float(candidates_arr[c_idx])
         true_wl = float(wavelengths_arr[wl_idx])
-        pred_wl = float(final_a2 * px ** 2 + final_a1 * px + final_a0)
         inliers.append(RansacInlier(
-            centroid_pixel        = px,
-            true_wavelength       = true_wl,
-            predicted_wavelength  = pred_wl,
-            residual_nm           = abs(pred_wl - true_wl),
+            centroid_pixel  = px,
+            true_wavelength = true_wl,
         ))
         matched_c_set.add(c_idx)
         matched_w_set.add(wl_idx)
@@ -403,24 +429,27 @@ def ransac_match_wavelengths(
 def print_ransac_report(result: RansacMatchResult) -> None:
     sep = "-" * 70
     print(sep)
-    print("  RANSAC Auto Line Identification Report (v4)")
+    print("  RANSAC 自动谱线识别报告")
     print(sep)
-    print(f"  Quadratic: WL = {result.a2:.8e}*px^2 "
+    print(f"  二次模型: WL = {result.a2:.8e}*px^2 "
           f"+ {result.a1:.6f}*px + {result.a0:.4f}")
     if result.inliers:
         inl_px = [x.centroid_pixel for x in result.inliers]
         d_min = 2 * result.a2 * min(inl_px) + result.a1
         d_max = 2 * result.a2 * max(inl_px) + result.a1
-        print(f"  Dispersion: [{d_min:.4f}, {d_max:.4f}] nm/px "
-              f"over [{min(inl_px):.0f}, {max(inl_px):.0f}] px")
-    print(f"  Inliers: {len(result.inliers)}  "
-          f"Outliers: {len(result.outlier_centroids)}  "
-          f"Unmatched: {len(result.unmatched_wavelengths)}")
+        print(f"  色散率范围 [{min(inl_px):.0f}, {max(inl_px):.0f}] px: "
+              f"[{d_min:.4f}, {d_max:.4f}] nm/px")
+    print(f"  内点数: {len(result.inliers)}  "
+          f"外点数: {len(result.outlier_centroids)}  "
+          f"未匹配波长数: {len(result.unmatched_wavelengths)}")
     if result.unmatched_wavelengths:
-        print(f"  Missing WLs: {result.unmatched_wavelengths}")
+        print(f"  未匹配波长: {result.unmatched_wavelengths}")
     print()
-    print(f"  {'Pixel':>10}  {'True WL':>12}  {'Pred WL':>12}  {'Resid':>8}")
+    print(f"  {'像素(px)':>10}  {'标准波长(nm)':>14}  "
+          f"{'预测波长(nm)':>14}  {'残差(nm)':>10}")
     for inl in sorted(result.inliers, key=lambda x: x.true_wavelength):
-        print(f"  {inl.centroid_pixel:10.3f}  {inl.true_wavelength:12.3f}"
-              f"  {inl.predicted_wavelength:12.3f}  {inl.residual_nm:8.4f}")
+        pred = result.predict(inl.centroid_pixel)
+        resid = pred - inl.true_wavelength
+        print(f"  {inl.centroid_pixel:10.3f}  {inl.true_wavelength:14.3f}  "
+              f"{pred:14.3f}  {resid:10.4f}")
     print(sep)
