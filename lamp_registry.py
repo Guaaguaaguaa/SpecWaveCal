@@ -80,13 +80,24 @@ LAMP_REGISTRY = {
         shift_search_radius = 50,
         ransac_tolerance_nm = 2.0,
     ),
-    # 未来新增光源示例（取消注释并填入真实数据即可启用，anchor_pixels 可省略）：
-    # "HgNe": LampConfig(
-    #     name               = "HgNe",
-    #     description        = "汞氖灯 (HgNe)",
-    #     true_wavelengths   = [...],
-    #     ransac_tolerance_nm= 2.0,
-    # ),
+    "KR": LampConfig(
+        name               = "KR",
+        description        = "氪灯 (Kr) — IS3 三灯联合定标用",
+        true_wavelengths   = [587.092, 785.482, 850.887, 892.869],
+        ransac_tolerance_nm = 2.0,
+    ),
+    "AR": LampConfig(
+        name               = "AR",
+        description        = "氩灯 (Ar) — IS3 三灯联合定标用",
+        true_wavelengths   = [696.543, 727.294, 866.794, 965.779],
+        ransac_tolerance_nm = 2.0,
+    ),
+    "NM": LampConfig(
+        name               = "NM",
+        description        = "氖汞灯 (NeHg) — IS3 三灯联合定标用",
+        true_wavelengths   = [435.833, 546.074, 1013.976],
+        ransac_tolerance_nm = 2.0,
+    ),
 }
 
 

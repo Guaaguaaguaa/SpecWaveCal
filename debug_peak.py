@@ -42,7 +42,7 @@ local_noise = estimate_local_noise(
 )
 
 # ── 检查区间（按需修改 START / END）─────────────────────────────────────────
-START, END = 927, 960   # 改成你想看的峰左侧范围
+START, END = 241, 248   # 改成你想看的峰左侧范围
 
 print(f"noise_std(全局) = {noise_std:.4f}\n")
 print(f"{'px':>4}  {'intensity':>10}  {'baseline':>9}  {'I_corr':>9}  "

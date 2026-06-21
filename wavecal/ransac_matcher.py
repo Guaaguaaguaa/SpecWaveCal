@@ -19,6 +19,15 @@ ransac_matcher.py — 基于 RANSAC 的自动谱线识别
     14.6 nm。sin 模型需 4 参数，搜索空间暴增 50 倍，收敛不可靠。
     最终定标由 calibrate() 用三次多项式完成，追求物理精度。
 
+设计变更记录（本版本）：
+    新增 excluded_centroids 参数：调用方可以把 peak_finder.py 里打了
+    FlagReason.SUSPECTED_ARTIFACT（疑似伪峰：窄峰+边际信噪比组合）等
+    强标记的候选峰质心传进来，在RANSAC种子抽样和内点投票开始前就排除，
+    避免这类低置信度候选污染二次模型拟合或意外抢占某条波长的"最佳匹配"
+    名额。默认 None，不传时行为与旧版完全一致。
+    排除过程全程可追溯：被排除的质心会原样保留在
+    RansacMatchResult.excluded_centroids 字段中，不是静默丢弃。
+
 暴露接口：
     RansacMatchResult, RansacInlier, RansacMatchError
     ransac_match_wavelengths(...)
@@ -27,8 +36,8 @@ ransac_matcher.py — 基于 RANSAC 的自动谱线识别
 
 import itertools
 import random
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -54,6 +63,9 @@ class RansacMatchResult:
     unmatched_wavelengths: List[float]
     n_iterations_used: int
     inlier_tolerance_nm: float
+    # 预过滤阶段被排除的候选峰（如调用方根据SUSPECTED_ARTIFACT等标记判定
+    # 为不可信、不参与匹配的质心）。全程记录，不是静默丢弃。
+    excluded_centroids : List[float] = field(default_factory=list)
 
     @property
     def calibration_pairs(self) -> List[tuple]:
@@ -199,6 +211,8 @@ def ransac_match_wavelengths(
     min_inliers           : Optional[int] = None,
     random_seed            : Optional[int] = None,
     require_positive_slope : bool = True,
+    excluded_centroids     : Optional[Iterable[float]] = None,
+    exclude_match_tol_px   : float = 1e-3,
 ) -> RansacMatchResult:
     """
     用 RANSAC 自动识别候选峰质心与已知参考波长的对应关系。
@@ -214,16 +228,48 @@ def ransac_match_wavelengths(
     min_inliers          : 最少内点数，默认 ceil(len(wavelengths) * 0.5)
     random_seed           : 随机种子，None 则不固定
     require_positive_slope: 是否强制色散方向为正
+    excluded_centroids    : 调用方根据峰质量标记（如 peak_finder.FlagReason.
+                             SUSPECTED_ARTIFACT）预先判定为不可信、不参与
+                             匹配的候选峰质心列表。这些点在种子抽样和内点
+                             投票开始前就被剔除，避免疑似伪峰被当作种子点
+                             拉偏二次模型，或者意外成为某条波长的"最佳匹配"。
+                             不是静默丢弃——会完整保留在返回结果的
+                             RansacMatchResult.excluded_centroids 字段中。
+                             默认 None，即不做任何预过滤，行为与旧版一致。
+    exclude_match_tol_px  : 把 candidate_centroids 中的值与 excluded_centroids
+                             做匹配的容差（像素），默认 1e-3，足够覆盖浮点
+                             精度误差
 
     Returns
     -------
     RansacMatchResult
     """
-    candidates = list(candidate_centroids)
+    candidates_input = list(candidate_centroids)
     wavelengths = list(true_wavelengths)
 
+    # ── 预过滤：剔除调用方标记为不可信的候选峰 ──────────────────────────────
+    #    必须在RANSAC种子抽样之前执行，否则疑似伪峰仍可能被抽中作为3点种子
+    #    之一，拉偏整个二次模型；或者在投票阶段意外成为某条波长距离最近的
+    #    "最佳匹配"，把真正的候选峰挤掉。
+    excluded_list: List[float] = []
+    if excluded_centroids:
+        excl_arr = np.asarray(list(excluded_centroids), dtype=float)
+        candidates: List[float] = []
+        for c in candidates_input:
+            if excl_arr.size and np.any(np.abs(excl_arr - c) <= exclude_match_tol_px):
+                excluded_list.append(c)
+            else:
+                candidates.append(c)
+    else:
+        candidates = candidates_input
+
     if len(candidates) < 3:
-        raise ValueError(f"候选峰数量 ({len(candidates)}) 少于 3 个。")
+        raise ValueError(
+            f"候选峰数量 ({len(candidates)}) 少于 3 个"
+            + (f"（已预先排除 {len(excluded_list)} 个标记为不可信的候选峰，"
+               f"若数量不足，请检查是否过滤过严）" if excluded_list else "")
+            + "。"
+        )
     if len(wavelengths) < 3:
         raise ValueError(f"已知波长数量 ({len(wavelengths)}) 少于 3 个。")
 
@@ -423,6 +469,7 @@ def ransac_match_wavelengths(
         unmatched_wavelengths = unmatched_wavelengths,
         n_iterations_used   = n_iterations,
         inlier_tolerance_nm = tolerance_nm,
+        excluded_centroids  = excluded_list,
     )
 
 
@@ -441,7 +488,10 @@ def print_ransac_report(result: RansacMatchResult) -> None:
               f"[{d_min:.4f}, {d_max:.4f}] nm/px")
     print(f"  内点数: {len(result.inliers)}  "
           f"外点数: {len(result.outlier_centroids)}  "
-          f"未匹配波长数: {len(result.unmatched_wavelengths)}")
+          f"未匹配波长数: {len(result.unmatched_wavelengths)}  "
+          f"预过滤排除数: {len(result.excluded_centroids)}")
+    if result.excluded_centroids:
+        print(f"  预过滤排除的候选峰（如疑似伪峰）: {result.excluded_centroids}")
     if result.unmatched_wavelengths:
         print(f"  未匹配波长: {result.unmatched_wavelengths}")
     print()

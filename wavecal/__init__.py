@@ -22,7 +22,7 @@ from .pipeline    import run_pipeline, run_explorer, PipelineResult
 from .config      import Config
 from .logger      import Logger, RejectReason
 from .baseline    import estimate_baseline, estimate_local_noise, snr
-from .peak_finder import (find_peaks, PeakResult,
+from .peak_finder import (find_peaks, PeakResult, FlagReason,
                            extract_peak_window,
                            compute_centroid, compute_sigma, compute_skewness)
 from .calibration import (calibrate, pixel_to_wavelength, wavelength_to_pixel,
@@ -34,6 +34,8 @@ from .ransac_matcher import (ransac_match_wavelengths, print_ransac_report,
                               RansacMatchResult, RansacInlier, RansacMatchError)
 from .explorer    import (peak_quality_report, suggest_calibration_peaks,
                            print_quality_table, save_quality_csv, PeakQuality)
+from .multi_lamp  import calibrate_multi_lamp, MultiLampResult
+from .auto_config import auto_tune_config, AutoTuneError
 
 __all__ = [
     # pipeline
@@ -45,7 +47,7 @@ __all__ = [
     # baseline
     "estimate_baseline", "estimate_local_noise", "snr",
     # peak_finder
-    "find_peaks", "PeakResult",
+    "find_peaks", "PeakResult", "FlagReason",
     "extract_peak_window", "compute_centroid", "compute_sigma", "compute_skewness",
     # calibration
     "calibrate", "pixel_to_wavelength", "wavelength_to_pixel",
@@ -58,4 +60,8 @@ __all__ = [
     # explorer
     "peak_quality_report", "suggest_calibration_peaks",
     "print_quality_table", "save_quality_csv", "PeakQuality",
+    # multi_lamp
+    "calibrate_multi_lamp", "MultiLampResult",
+    # auto_config
+    "auto_tune_config", "AutoTuneError",
 ]

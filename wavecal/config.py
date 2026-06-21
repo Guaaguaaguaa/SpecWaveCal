@@ -80,6 +80,16 @@ class Config:
     #       如果仪器分辨率低或峰很宽，可适当放大到 60~80
     max_half_width       : int   = 40
 
+    # 窄峰自适应SNR的参考宽度（px）
+    # 依据：半宽小于此值时，要求的SNR按 (此值/half_width) 倍放大——峰越窄，
+    #       参与判断的像素点越少，纯噪声偶然凑出临界SNR的概率越高，需要更强
+    #       的信号确认才可信。与 min_half_width 故意保持独立、不联动：
+    #       min_half_width 是"过窄"的硬性标记线，可能因为仪器欠采样（如采样
+    #       间隔粗的低通道数仪器）被调到很低（如1）以容纳真实的窄峰；但这不
+    #       代表噪声纹波凑出的窄峰也应该被同等放行，所以本参数固定在3.0这个
+    #       历史经验值上，不随 min_half_width 调整而联动放松
+    snr_scale_reference_width: float = 3.0
+
     # ── 对称性检验 ───────────────────────────────────────────────────────────
     # 有效峰对称性阈值（归一化三阶矩 |skewness|）
     # 依据：ASTM E1655 / 工业近红外领域常用 0.5 作为可接受上限
@@ -167,6 +177,7 @@ class Config:
             "saddle_n_sigma"       : "谷底判定宽容倍数，推荐 1.5~2.0",
             "min_half_width"       : "单侧最小半宽（px），< 3 视为噪声尖刺",
             "max_half_width"       : "单侧最大半宽（px），宽峰仪器可放大到 60~80",
+            "snr_scale_reference_width": "窄峰自适应SNR参考宽度（px），半宽小于此值时要求的SNR按比例提高，与min_half_width独立不联动",
             "skewness_threshold"   : "对称性阈值，|skewness| > 此值则舍弃",
             "core_height_ratio"    : "核心窗口阈值比例，质心/对称性只在此区域内计算，推荐0.05",
             "calibration_degree"   : "定标多项式阶数，通常 3",

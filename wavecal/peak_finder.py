@@ -4,13 +4,26 @@ peak_finder.py — 寻峰、边界分析、对称性检验、质心定位
 
 设计原则（重要变更）：
     本模块不再自动剔除任何候选峰。所有质量检测（SNR、宽度、边界收敛质量、
-    对称性）都只打标签、记录具体原因，不影响该峰是否进入返回列表。
+    对称性、峰间距）都只打标签、记录具体原因，不影响该峰是否进入返回列表。
     每个候选峰都会被计算质心并返回，是否采用交由人工依据
     PeakResult.passed_all 和 PeakResult.fail_reasons 自行判断。
 
     原因：实际数据质量参差不齐，自动硬性剔除在生产中容易因为单一阈值
     不合理而连锁影响后续定标流程（误伤本可以用的峰，或者掩盖了
     "仪器分辨率不足导致双峰粘连"这类需要人工介入的真实问题）。
+
+设计变更记录（本版本）：
+    1. Step 1 粗寻峰不再用 scipy 的 distance=min_peak_sep 做硬性剔除——
+       旧版若两峰间距小于 min_peak_sep，矮的一个会直接消失，不进入返回
+       列表，日志也无痕迹。这在采样间隔粗的仪器上（真实谱线像素间距被
+       压缩）会系统性吞掉真实强峰。现在改为：取全部局部极大值，min_peak_sep
+       范围内是否存在更高邻居只作为 FlagReason.NEAR_TALLER_NEIGHBOR 标记。
+    2. 新增窄峰自适应SNR判断：半宽小于 snr_scale_reference_width 时，
+       要求的 SNR 按比例提高（峰越窄，可信所需的SNR越高），同时满足
+       "窄于min_half_width 且 SNR也不达标"才标记为
+       FlagReason.SUSPECTED_ARTIFACT（疑似伪峰），单纯窄但SNR足够高的
+       真实窄峰不会被误标。snr_scale_reference_width 与 min_half_width
+       是两个独立参数，不互相联动。
 
 暴露接口：
     find_peaks(intensity, baseline, noise_std, local_noise, config, logger)
@@ -68,6 +81,8 @@ class FlagReason:
     NEGATIVE_WING      = "扣基线后出现大范围负值（基线估计异常）"
     BOUNDARY_FORCED    = "边界未自然收敛，已强制截断"
     BOUNDARY_HIGH_SADDLE = "边界谷底明显高于基线（疑似双峰粘连/仪器分辨率不足）"
+    NEAR_TALLER_NEIGHBOR = "min_peak_sep范围内存在更高峰（原方案会被distance直接剔除，现仅标记）"
+    SUSPECTED_ARTIFACT   = "疑似伪峰（窄峰+边际信噪比组合，置信度不足）"
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -108,6 +123,11 @@ def find_peaks(
     # ── 硬限制（仅用于标记，不剔除）─────────
     min_half_width  : int   = 3,
     max_half_width  : int   = 40,
+    # ── 窄峰自适应SNR（与min_half_width解耦：min_half_width是"过窄"的硬性
+    #    标记线，可随仪器调低；snr_scale_reference_width是"足够宽到无需
+    #    额外信噪比加成"的参考宽度，默认沿用旧版min_half_width=3的物理含义，
+    #    不随min_half_width联动，避免仪器调窄后连带放松了伪峰判定）────────
+    snr_scale_reference_width: float = 3.0,
     # ── 对称性 ────────────────────────────
     skewness_threshold: float = 0.5,
     # ── 核心窗口 ──────────────────────────
@@ -144,27 +164,43 @@ def find_peaks(
     I_corr = intensity - baseline
     boundary_thresh_arr = boundary_n_sigma * local_noise
 
-    # ── Step 1：粗寻峰 ────────────────────────────────────────────────────────
+    # ── Step 1：粗寻峰（不再用 distance 做硬性剔除，只取局部极大值）──────────
+    #    旧版用 scipy 的 distance=min_peak_sep 参数：两个局部极大值间距小于
+    #    min_peak_sep 时，矮的一个会被直接丢弃且不留任何痕迹（不进入返回
+    #    列表，日志里也查无此峰）。这与本模块"不自动剔除候选峰"的设计原则
+    #    矛盾，且在采样间隔较粗的仪器上（真实谱线间距压缩到 min_peak_sep
+    #    像素以内）会系统性吞掉真实强峰。现在改为：min_peak_sep 范围内
+    #    是否存在更高的邻居，只作为标记（NEAR_TALLER_NEIGHBOR），峰本身
+    #    依然保留在返回列表中。
     min_height = min_snr * noise_std
     raw_peaks, _ = scipy_find_peaks(
         I_corr,
         height=min_height,
-        distance=min_peak_sep,
     )
 
-    logger.info(f"粗寻峰完成，候选峰数量: {len(raw_peaks)}")
+    logger.info(f"粗寻峰完成（不做间距强制剔除），候选峰数量: {len(raw_peaks)}")
+
+    # 向量化计算每个候选峰 min_peak_sep 像素范围内是否存在更高的邻居
+    peak_heights_arr = I_corr[raw_peaks]
+    if len(raw_peaks) > 0:
+        pixel_diff  = np.abs(raw_peaks[:, None] - raw_peaks[None, :])
+        nearby_mask = (pixel_diff > 0) & (pixel_diff <= min_peak_sep)
+        taller_nearby = np.array([
+            nearby_mask[i].any() and peak_heights_arr[nearby_mask[i]].max() > peak_heights_arr[i]
+            for i in range(len(raw_peaks))
+        ])
+    else:
+        taller_nearby = np.array([], dtype=bool)
 
     results: List[PeakResult] = []
 
-    for p in raw_peaks:
+    for idx, p in enumerate(raw_peaks):
         fail_reasons: List[str] = []
         peak_height = float(I_corr[p])
         peak_snr    = peak_height / noise_std
 
-        if peak_snr < min_snr:
-            fail_reasons.append(
-                f"{FlagReason.LOW_SNR}(snr={peak_snr:.2f}<{min_snr})"
-            )
+        if taller_nearby[idx]:
+            fail_reasons.append(FlagReason.NEAR_TALLER_NEIGHBOR)
 
         # ── Step 2：边界拓展（不剔除，强制给出边界 + 质量标记）─────────────────
         left, left_quality = _find_boundary(
@@ -192,8 +228,35 @@ def find_peaks(
 
         half_width = (right - left) / 2.0
 
-        # ── Step 3：宽度标记（不剔除）─────────────────────────────────────────
-        if half_width < min_half_width:
+        # ── Step 3：宽度 × 自适应SNR 联合判断（不剔除）─────────────────────────
+        #    Step 1 的 height=min_snr*noise_std 已保证所有候选峰 SNR>=min_snr，
+        #    单独的"SNR不足"判断在这里已经恒为假，不再重复判断。
+        #    但 min_snr 这个统一底线对"窄峰"区分度不够：半宽只有1~2px的峰，
+        #    参与判断的像素点很少，纯噪声偶然凑出一个临界SNR的概率明显更高，
+        #    需要更高的SNR才能视为可信信号，而不是宽峰那一档"过线即可"的标准。
+        #    snr_scale_reference_width 与 min_half_width 解耦：后者是"过窄"
+        #    的硬性标记线（可随仪器调低，比如新仪器调到1），前者是"足够宽、
+        #    无需额外信噪比加成"的参考宽度，默认保持3.0，不随min_half_width
+        #    联动——否则把min_half_width调低后，这里的窄峰伪峰判定也会跟着
+        #    失效（窄峰会重新被视为"宽度正常"，绕过本该有的高SNR要求）。
+        if half_width < snr_scale_reference_width:
+            required_snr = min_snr * (snr_scale_reference_width / max(half_width, 0.1))
+        else:
+            required_snr = min_snr
+
+        # 注意：这里不能用 is_narrow(=half_width<min_half_width) 来gate这个判断，
+        # 否则 min_half_width 被调低后（比如新仪器调到1），半宽1.0~2.9px的伪峰会
+        # 因为"不算窄"而绕过自适应SNR要求，重新被判定为正常峰——这正是之前的bug。
+        # SUSPECTED_ARTIFACT 必须只取决于 snr_scale_reference_width，与 min_half_width
+        # 彻底解耦。
+        if peak_snr < required_snr:
+            fail_reasons.append(
+                f"{FlagReason.SUSPECTED_ARTIFACT}"
+                f"(half_width={half_width:.2f}, snr={peak_snr:.2f}<要求{required_snr:.2f})"
+            )
+        elif half_width < min_half_width:
+            # SNR已经达到该宽度下的可信要求，但仍窄于硬性下限 → 单纯标记宽度
+            # 异常，不再质疑其真实性
             fail_reasons.append(
                 f"{FlagReason.WIDTH_TOO_NARROW}(half_width={half_width:.2f}<{min_half_width})"
             )
